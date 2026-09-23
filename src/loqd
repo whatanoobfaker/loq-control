@@ -32,6 +32,14 @@ def grant():
             os.chmod(p, 0o664)
 
 
+def needs_grant():
+    try:
+        st = os.stat(os.path.join(lc.LEGION, "fancurve"))
+    except OSError:
+        return False
+    return not st.st_mode & 0o020
+
+
 def wait_for_hardware(timeout=30):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -179,7 +187,7 @@ def main():
             on_profile(lc.load_config(), profile)
             continue
         m = os.path.getmtime(lc.CONFIG) if os.path.exists(lc.CONFIG) else 0
-        if m != cfg_mtime:
+        if m != cfg_mtime or needs_grant():
             cfg_mtime = m
             grant()
 
