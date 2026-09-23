@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 import grp
+import json
 import os
 import select
 import signal
@@ -117,6 +118,107 @@ def apply_leds(cfg):
                 log("led %s: %s" % (name, e))
 
 
+class ThermalController:
+    KP = 1.6
+    KI = 0.25
+
+    def __init__(self):
+        self.base = {}
+        self.integral = 0.0
+        self.temp = None
+        self.pl1 = None
+        self.active = False
+        self.last_write = None
+        self.last_time = 0.0
+        self.source = None
+        self.written = {}
+
+    def capture_base(self):
+        self.base = {}
+        for d in lc.RAPL_DOMAINS:
+            pl1, pl2 = lc.rapl_limits(d)
+            if pl1 and pl2:
+                self.base[d] = (pl1, pl2)
+        self.integral = 0.0
+        self.pl1 = None
+        self.last_write = None
+
+    def ceiling(self):
+        return min(v[0] for v in self.base.values()) / 1e6 if self.base else None
+
+    def restore(self):
+        for d, (pl1, pl2) in self.base.items():
+            try:
+                lc.set_rapl(d, pl1, pl2)
+            except OSError as e:
+                log("rapl restore %s: %s" % (d, e))
+        self.active = False
+        self.pl1 = None
+        self.last_write = None
+        self.status(None)
+
+    def status(self, cfg):
+        os.makedirs(lc.RUN_DIR, exist_ok=True)
+        data = {"active": self.active, "pl1": self.pl1, "temp": self.temp, "source": self.source,
+                "ceiling": self.ceiling(), "target": cfg["target"] if cfg else None}
+        tmp = lc.THERMAL_STATUS + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, lc.THERMAL_STATUS)
+
+    def step(self, cfg, dt):
+        source = lc.power_source()
+        if source != self.source:
+            if self.source is None:
+                self.capture_base()
+            else:
+                time.sleep(1.0)
+                for d in list(self.base):
+                    cur = lc.rapl_limits(d)
+                    if cur[0] and cur != self.written.get(d):
+                        self.base[d] = cur
+                self.integral = 0.0
+                self.last_write = None
+            self.source = source
+            log("power source: %s, firmware PL1 %.0f W" % (source, self.ceiling() or 0))
+        t = lc.thermal_settings(cfg, source)
+        if not t.get("enabled"):
+            if self.active:
+                self.restore()
+            return
+        if not self.base:
+            self.capture_base()
+        top = self.ceiling()
+        if not top:
+            return
+        raw = lc.cpu_temp()
+        if raw is None:
+            return
+        self.temp = raw if self.temp is None else self.temp * 0.6 + raw * 0.4
+        target = float(t.get("target", 82))
+        lo = float(t.get("min_watts", 20))
+        err = target - self.temp
+        self.integral = max(-(top - lo) / self.KI, min(0.0, self.integral + err * dt))
+        want = max(lo, min(top, top + self.KP * err + self.KI * self.integral))
+        self.pl1 = want
+        self.active = True
+        w = int(round(want))
+        now = time.monotonic()
+        if w != self.last_write or now - self.last_time > 10:
+            self.last_time = now
+            for d, (b1, b2) in self.base.items():
+                pl1 = min(b1, w * 1000000)
+                pl2 = min(b2, max(pl1, int((w + max(15, w * 0.4)) * 1e6)))
+                try:
+                    lc.set_rapl(d, pl1, pl2)
+                    self.written[d] = (pl1, pl2)
+                except OSError as e:
+                    log("rapl %s: %s" % (d, e))
+            self.last_write = w
+        self.status(t)
+
+
 def on_profile(cfg, profile):
     time.sleep(0.8)
     capture_firmware_curve(profile)
@@ -166,29 +268,50 @@ def main():
     poller = select.poll()
     poller.register(f.fileno(), select.POLLPRI | select.POLLERR)
     cfg_mtime = os.path.getmtime(lc.CONFIG) if os.path.exists(lc.CONFIG) else 0
+    thermal = ThermalController()
+    thermal.capture_base()
+    cfg = lc.load_config()
+    last = time.monotonic()
+
+    def shutdown(*_):
+        if thermal.active:
+            thermal.restore()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
 
     while True:
         try:
-            events = poller.poll(2000)
+            events = poller.poll(1000)
         except InterruptedError:
             events = []
+        now = time.monotonic()
+        thermal.step(cfg, now - last)
+        last = now
         if events:
             f.seek(0)
             f.read()
         if reapply["flag"]:
             reapply["flag"] = False
             grant()
+            if thermal.active:
+                thermal.restore()
             current = apply_all(False)
+            thermal.capture_base()
             continue
         profile = lc.get_profile()
         if profile != current:
             log("profile %s -> %s" % (current, profile))
             current = profile
+            if thermal.active:
+                thermal.restore()
             on_profile(lc.load_config(), profile)
+            thermal.capture_base()
             continue
         m = os.path.getmtime(lc.CONFIG) if os.path.exists(lc.CONFIG) else 0
         if m != cfg_mtime or needs_grant():
             cfg_mtime = m
+            cfg = lc.load_config()
             grant()
 
 

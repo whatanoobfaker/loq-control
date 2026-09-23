@@ -182,8 +182,38 @@ def leds():
     return out
 
 
+RAPL_DOMAINS = ["/sys/class/powercap/intel-rapl:0", "/sys/class/powercap/intel-rapl-mmio:0"]
+THERMAL_STATUS = "/run/loq-control/thermal.json"
+
+
+def rapl_limits(domain):
+    pl1 = read_int(os.path.join(domain, "constraint_0_power_limit_uw"))
+    pl2 = read_int(os.path.join(domain, "constraint_1_power_limit_uw"))
+    return pl1, pl2
+
+
+def set_rapl(domain, pl1_uw, pl2_uw):
+    write(os.path.join(domain, "constraint_0_power_limit_uw"), int(pl1_uw))
+    write(os.path.join(domain, "constraint_1_power_limit_uw"), int(pl2_uw))
+
+
+def thermal_settings(cfg, source):
+    t = cfg.get("thermal") or {}
+    if "enabled" in t:
+        t = {"ac": dict(t), "battery": dict(t)}
+    d = default_config()["thermal"][source]
+    d.update(t.get(source) or {})
+    return d
+
+
+def power_source():
+    return "battery" if ac_online() is False else "ac"
+
+
 def default_config():
     return {
+        "thermal": {"ac": {"enabled": False, "target": 82, "min_watts": 20},
+                    "battery": {"enabled": False, "target": 75, "min_watts": 12}},
         "restore_profile": False,
         "profile": None,
         "curves": {},
