@@ -2,12 +2,12 @@
 set -e
 [ "$(id -u)" = 0 ] || exec pkexec "$(readlink -f "$0")" "$@"
 cd "$(dirname "$(readlink -f "$0")")"
-V=1.0
+V=1.1
 
 for old in $(dkms status 2>/dev/null | awk -F'[/,:]' '/^lenovolegionlinux\//{print $2}' | sort -u); do
 	dkms remove -m lenovolegionlinux -v "$old" --all || true
 done
-dkms remove -m loq-legion -v $V --all >/dev/null 2>&1 || true
+for o in $(dkms status 2>/dev/null | awk -F"[/,:]" "/^loq-legion\//{print \$2}" | sort -u); do dkms remove -m loq-legion -v "$o" --all; done >/dev/null 2>&1 || true
 rm -rf /usr/src/loq-legion-$V
 install -d /usr/src/loq-legion-$V
 install -m644 driver/legion-laptop.c driver/Makefile driver/dkms.conf /usr/src/loq-legion-$V/

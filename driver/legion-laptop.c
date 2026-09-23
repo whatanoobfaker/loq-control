@@ -4793,7 +4793,6 @@ static const struct legion_wmi_private legion_wmi_context_f = {
 //#define LEGION_WMI_GUID_GAMEZONE_DATA_EVENT  "887b54e3-dddc-4b2c-8b88-68a26a8835d0"
 
 static const struct wmi_device_id legion_wmi_ids[] = {
-	{ LEGION_WMI_GAMEZONE_GUID, &legion_wmi_context_gamezone },
 	{ LEGION_WMI_GUID_FAN_EVENT, &legion_wmi_context_a },
 	{ LEGION_WMI_GUID_FAN2_EVENT, &legion_wmi_context_b },
 	{ LEGION_WMI_GUID_GAMEZONE_KEY_EVENT, &legion_wmi_context_c },
