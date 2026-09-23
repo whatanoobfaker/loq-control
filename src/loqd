@@ -10,6 +10,7 @@ import time
 
 sys.path.insert(0, "/usr/lib/loq-control")
 import loqcommon as lc
+import loqdtt
 
 
 def log(msg):
@@ -159,14 +160,8 @@ class ThermalController:
         self.status(None)
 
     def status(self, cfg):
-        os.makedirs(lc.RUN_DIR, exist_ok=True)
-        data = {"active": self.active, "pl1": self.pl1, "temp": self.temp, "source": self.source,
-                "ceiling": self.ceiling(), "target": cfg["target"] if cfg else None}
-        tmp = lc.THERMAL_STATUS + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, lc.THERMAL_STATUS)
+        write_status({"engine": "target", "active": self.active, "pl1": self.pl1, "temp": self.temp,
+                      "source": self.source, "ceiling": self.ceiling(), "target": cfg["target"] if cfg else None})
 
     def step(self, cfg, dt):
         source = lc.power_source()
@@ -220,15 +215,19 @@ class ThermalController:
         self.status(t)
 
 
-def sync_thermald(cfg):
-    want = lc.thermal_mode(cfg) == "dtt"
-    active = subprocess.run(["systemctl", "is-active", "--quiet", "thermald.service"]).returncode == 0
-    if want and not active:
-        r = subprocess.run(["systemctl", "start", "thermald.service"], capture_output=True, text=True)
-        log("thermald start: %s" % (r.stderr.strip() or "ok"))
-    elif not want and active:
+def stop_thermald():
+    if subprocess.run(["systemctl", "is-active", "--quiet", "thermald.service"]).returncode == 0:
         subprocess.run(["systemctl", "stop", "thermald.service"])
-        log("thermald stopped")
+        log("stopped thermald: loqd runs the DTT tables itself")
+
+
+def write_status(data):
+    os.makedirs(lc.RUN_DIR, exist_ok=True)
+    tmp = lc.THERMAL_STATUS + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, lc.THERMAL_STATUS)
 
 
 def on_profile(cfg, profile):
@@ -283,12 +282,16 @@ def main():
     thermal = ThermalController()
     thermal.capture_base()
     cfg = lc.load_config()
-    sync_thermald(cfg)
+    stop_thermald()
+    dtt = loqdtt.DttEngine(log)
+    dtt.load()
     last = time.monotonic()
 
     def shutdown(*_):
         if thermal.active:
             thermal.restore()
+        if dtt.active:
+            dtt.restore()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, shutdown)
@@ -299,7 +302,17 @@ def main():
         except InterruptedError:
             events = []
         now = time.monotonic()
-        thermal.step(cfg, now - last)
+        mode = lc.thermal_mode(cfg)
+        if mode == "dtt":
+            if thermal.active:
+                thermal.restore()
+            dtt.step(now - last)
+            write_status(dtt.status())
+        else:
+            if dtt.active:
+                dtt.restore()
+                write_status({"engine": mode, "active": False})
+            thermal.step(cfg, now - last)
         last = now
         if events:
             f.seek(0)
@@ -309,8 +322,11 @@ def main():
             grant()
             if thermal.active:
                 thermal.restore()
+            if dtt.active:
+                dtt.restore()
             current = apply_all(False)
             thermal.capture_base()
+            dtt.capture_base()
             continue
         profile = lc.get_profile()
         if profile != current:
@@ -327,7 +343,6 @@ def main():
             cfg = lc.load_config()
             if thermal.active and lc.thermal_mode(cfg) != "target":
                 thermal.restore()
-            sync_thermald(cfg)
             grant()
 
 

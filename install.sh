@@ -17,7 +17,7 @@ install -Dm644 system/loq-legion.conf /etc/modules-load.d/loq-legion.conf
 
 install -d /usr/lib/loq-control /usr/share/loq-control
 install -m755 src/loqd src/loq-control /usr/lib/loq-control/
-install -m644 src/loqcommon.py /usr/lib/loq-control/
+install -m644 src/loqcommon.py src/loqdtt.py /usr/lib/loq-control/
 ln -sf /usr/lib/loq-control/loq-control /usr/bin/loq-control
 install -Dm644 system/loq-control.desktop /usr/share/applications/loq-control.desktop
 install -Dm644 system/loq-control-autostart.desktop /usr/share/loq-control/loq-control-autostart.desktop

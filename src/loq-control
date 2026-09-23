@@ -492,7 +492,7 @@ class PowerPage:
         head.setSpacing(0)
         ht = QLabel("Automatic thermal control")
         ht.setObjectName("rowTitle")
-        hd = QLabel("Lenovo DTT runs Intel's thermald on the DTT tables in your BIOS, the same rules Windows uses: "
+        hd = QLabel("Lenovo DTT reads the Intel DTT tables in your BIOS and applies them the way Windows does: "
                     "per-mode power ranges and throttling driven by the CPU and five skin sensors. Target temperature "
                     "is LOQ Control's own loop that holds the CPU at a chosen temperature, with separate plugged-in and "
                     "battery settings below. Only one runs at a time.")
@@ -685,9 +685,18 @@ class PowerPage:
         lim = "PL1 %.0f W · PL2 %.0f W" % (pl[0] / 1e6, pl[1] / 1e6) if pl[0] and pl[1] else ""
         skins = "  ".join("%s %.0f°" % (n, t) for n, t in lc.skin_sensors())
         if mode == "dtt":
-            running = subprocess.run(["systemctl", "is-active", "--quiet", "thermald.service"]).returncode == 0
-            self.th_state.setText("Lenovo DTT via thermald: %s · %s\nSkin sensors: %s" % (
-                "running, following the BIOS tables for this mode" if running else "not running", lim, skins))
+            if st.get("engine") == "dtt" and st.get("error"):
+                self.th_state.setText("Lenovo DTT unavailable: %s" % st["error"])
+            elif st.get("engine") == "dtt" and st.get("active"):
+                lo, hi = st.get("range") or (0, 0)
+                hot = ", ".join(st.get("hot") or []) or "none"
+                trips = "  ".join("%s>%.0f°" % (n, t) for n, t in st.get("trips") or [])
+                self.th_state.setText("Lenovo DTT: %s · PL1 %.0f W (range %.0f–%.0f) · PL2 %.0f W · throttling for: %s\n"
+                                      "Trips (%s table): %s\nSkin sensors now: %s" % (
+                                          st.get("target_name"), st.get("pl1") or 0, lo, hi, st.get("pl2") or 0,
+                                          hot, st.get("psvt"), trips, skins))
+            else:
+                self.th_state.setText("Lenovo DTT: starting…")
         elif mode == "off":
             self.th_state.setText("Off: the firmware alone decides (up to 95 W in Balanced). %s" % lim)
         elif st.get("active") and st.get("pl1") is not None:

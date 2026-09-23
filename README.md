@@ -9,9 +9,10 @@ Fan curve, power limit and device control for the **Lenovo LOQ 15IRX9** (BIOS `N
   curve on every mode change; `loqd` puts yours back.
 - **Device**: battery conservation, rapid charge, Fn lock, Windows key, touchpad, display overdrive, G-Sync,
   camera, keyboard backlight and lighting.
-- **Automatic thermal control**: Lenovo DTT through Intel's `thermald --adaptive`, which runs the DTT tables in the
-  BIOS (per-mode power ranges, skin-sensor throttling) like Windows does, or LOQ Control's own target-temperature
-  loop on the RAPL limits.
+- **Automatic thermal control**: Lenovo DTT, a port of the adaptive engine of Intel's thermald built into `loqd`.
+  It parses the DTT data vault (GDDV) in the BIOS, matches its conditions (power mode, AC/battery, lid, sensor
+  temperatures) to a target, and applies that target's PL1 range, PL2 and skin-sensor passive trips through RAPL,
+  like DTT on Windows. LOQ Control's own target-temperature loop is the alternative.
 - **Tray icon** with live CPU temperature, quick mode switching and a maximum-fans toggle.
 
 ## Components
@@ -22,6 +23,7 @@ Fan curve, power limit and device control for the **Lenovo LOQ 15IRX9** (BIOS `N
 | `src/loqd` | root service: grants the `wheel` group access to the controls, restores settings at boot and resume, re-applies the fan curve after mode changes |
 | `src/loq-control` | PySide6 app |
 | `src/loqcommon.py` | shared hardware layer |
+| `src/loqdtt.py` | DTT data vault parser and adaptive engine (port of thermald's GDDV/adaptive code, GPL-2.0) |
 | `system/` | systemd unit, sleep hook, module autoload, desktop entries |
 
 Power modes and limits go through the kernel's `lenovo-wmi-gamezone` / `lenovo-wmi-other` drivers
@@ -29,7 +31,7 @@ Power modes and limits go through the kernel's `lenovo-wmi-gamezone` / `lenovo-w
 
 ## Install
 
-Requires `dkms`, kernel headers, `python-pyside6`, `thermald` (for Lenovo DTT), and membership in the `wheel` group.
+Requires `dkms`, kernel headers, `python-pyside6`, and membership in the `wheel` group.
 
 ```sh
 ./install.sh
