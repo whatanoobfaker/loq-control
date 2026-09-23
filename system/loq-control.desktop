@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=LOQ Control
+GenericName=Laptop Control Center
+Comment=Fans, power limits, battery and keyboard settings for the Lenovo LOQ
+Exec=loq-control
+Icon=computer-laptop
+Categories=System;Settings;HardwareSettings;
+Keywords=fan;thermal;power;lenovo;vantage;battery;
+StartupNotify=false

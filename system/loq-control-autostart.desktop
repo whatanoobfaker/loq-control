@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=LOQ Control
+Exec=loq-control --tray
+Icon=computer-laptop
+X-KDE-autostart-after=panel
+NoDisplay=true

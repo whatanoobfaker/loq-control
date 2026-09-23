@@ -1,0 +1,13 @@
+[Unit]
+Description=LOQ Control daemon (fan curve, power limits, device settings)
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/loq-control/loqd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

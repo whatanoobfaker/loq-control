@@ -1,0 +1,3 @@
+#!/bin/sh
+[ "$1" = post ] && systemctl kill -s HUP loqd.service
+exit 0

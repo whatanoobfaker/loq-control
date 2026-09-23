@@ -1,0 +1,188 @@
+#!/usr/bin/python3
+import grp
+import os
+import select
+import signal
+import sys
+import time
+
+sys.path.insert(0, "/usr/lib/loq-control")
+import loqcommon as lc
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def grant():
+    gid = grp.getgrnam(lc.GROUP).gr_gid
+    for p in lc.controlled_paths():
+        try:
+            os.chown(p, 0, gid)
+            mode = 0o640 if p.endswith("energy_uj") else 0o664
+            os.chmod(p, mode)
+        except OSError as e:
+            log("grant %s: %s" % (p, e))
+    os.makedirs(lc.STATE_DIR, exist_ok=True)
+    os.chown(lc.STATE_DIR, 0, gid)
+    os.chmod(lc.STATE_DIR, 0o2775)
+    for p in (lc.CONFIG, lc.FIRMWARE_CURVES):
+        if os.path.exists(p):
+            os.chown(p, 0, gid)
+            os.chmod(p, 0o664)
+
+
+def wait_for_hardware(timeout=30):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if os.path.exists(os.path.join(lc.LEGION, "fancurve")) and os.path.exists(lc.profile_path()):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def capture_firmware_curve(profile):
+    if not profile:
+        return
+    curves = lc.load_firmware_curves()
+    if profile in curves:
+        return
+    pts = lc.read_curve()
+    if pts:
+        curves[profile] = pts
+        lc.save_json(lc.FIRMWARE_CURVES, curves)
+        log("captured firmware curve for %s" % profile)
+
+
+def apply_curve(cfg, profile):
+    entry = cfg.get("curves", {}).get(profile)
+    if not entry or not entry.get("enabled"):
+        return
+    pts = entry.get("points")
+    err = lc.validate_curve(pts or [])
+    if err:
+        log("curve for %s invalid: %s" % (profile, err))
+        return
+    for _ in range(5):
+        try:
+            lc.write_curve(pts)
+            if lc.read_curve() == pts:
+                log("applied custom curve for %s" % profile)
+                return
+        except OSError as e:
+            log("curve write: %s" % e)
+        time.sleep(0.4)
+
+
+def apply_limits(cfg):
+    for name, value in cfg.get("limits", {}).items():
+        info = lc.limit_info(name)
+        if not info or info["value"] == value:
+            continue
+        for _ in range(5):
+            try:
+                lc.set_limit(name, value)
+                break
+            except OSError:
+                time.sleep(0.4)
+        else:
+            log("limit %s=%s failed" % (name, value))
+
+
+def apply_toggles(cfg):
+    for name, value in cfg.get("toggles", {}).items():
+        p = lc.toggle_path(name)
+        if p and os.path.exists(p) and lc.read(p) != str(value):
+            try:
+                lc.write(p, value)
+            except OSError as e:
+                log("toggle %s: %s" % (name, e))
+
+
+def apply_leds(cfg):
+    for name, value in cfg.get("leds", {}).items():
+        p = os.path.join("/sys/class/leds", name, "brightness")
+        if os.path.exists(p):
+            try:
+                lc.write(p, value)
+            except OSError as e:
+                log("led %s: %s" % (name, e))
+
+
+def on_profile(cfg, profile):
+    time.sleep(0.8)
+    capture_firmware_curve(profile)
+    if profile == "custom":
+        apply_limits(cfg)
+    apply_curve(cfg, profile)
+
+
+def apply_all(boot):
+    cfg = lc.load_config()
+    apply_toggles(cfg)
+    apply_leds(cfg)
+    if boot and cfg.get("restore_profile") and cfg.get("profile") in lc.profile_choices():
+        if lc.get_profile() != cfg["profile"]:
+            capture_firmware_curve(lc.get_profile())
+            lc.set_profile(cfg["profile"])
+            time.sleep(0.8)
+    profile = lc.get_profile()
+    if boot:
+        capture_firmware_curve(profile)
+    if profile == "custom":
+        apply_limits(cfg)
+    apply_curve(cfg, profile)
+    return profile
+
+
+def main():
+    if not wait_for_hardware():
+        log("legion driver or platform profile not present")
+    grant()
+    os.makedirs(lc.RUN_DIR, exist_ok=True)
+    marker = os.path.join(lc.RUN_DIR, "booted")
+    boot = not os.path.exists(marker)
+    open(marker, "w").close()
+    current = apply_all(boot)
+
+    reapply = {"flag": False}
+
+    def hup(*_):
+        reapply["flag"] = True
+
+    signal.signal(signal.SIGHUP, hup)
+
+    ppath = lc.profile_path()
+    f = open(ppath)
+    f.read()
+    poller = select.poll()
+    poller.register(f.fileno(), select.POLLPRI | select.POLLERR)
+    cfg_mtime = os.path.getmtime(lc.CONFIG) if os.path.exists(lc.CONFIG) else 0
+
+    while True:
+        try:
+            events = poller.poll(2000)
+        except InterruptedError:
+            events = []
+        if events:
+            f.seek(0)
+            f.read()
+        if reapply["flag"]:
+            reapply["flag"] = False
+            grant()
+            current = apply_all(False)
+            continue
+        profile = lc.get_profile()
+        if profile != current:
+            log("profile %s -> %s" % (current, profile))
+            current = profile
+            on_profile(lc.load_config(), profile)
+            continue
+        m = os.path.getmtime(lc.CONFIG) if os.path.exists(lc.CONFIG) else 0
+        if m != cfg_mtime:
+            cfg_mtime = m
+            grant()
+
+
+if __name__ == "__main__":
+    main()

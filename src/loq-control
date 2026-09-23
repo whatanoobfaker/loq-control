@@ -1,0 +1,1246 @@
+#!/usr/bin/python3
+import os
+import subprocess
+import sys
+import time
+from collections import deque
+
+sys.path.insert(0, "/usr/lib/loq-control")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import loqcommon as lc
+
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, Signal, QSize
+from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPainterPath,
+                           QPalette, QPen, QPixmap, QBrush, QLinearGradient)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFrame, QGridLayout, QGroupBox,
+                               QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
+                               QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSlider,
+                               QSpinBox, QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget,
+                               QButtonGroup, QAbstractButton)
+
+HISTORY = 180
+ACCENT = QColor("#e2231a")
+SERIES = {
+    "cpu": QColor("#ff6b4a"),
+    "gpu": QColor("#76b900"),
+    "fan1": QColor("#3daee9"),
+    "fan2": QColor("#a37bf2"),
+    "pkg": QColor("#f5a623"),
+    "bat": QColor("#2ecc71"),
+}
+
+PRESET_T = [45, 55, 62, 68, 74, 80, 85, 90, 95, 100]
+PRESET_G = [45, 52, 58, 64, 70, 75, 79, 83, 87, 90]
+PRESETS = {
+    "Quiet": [0, 1600, 2000, 2400, 2800, 3200, 3600, 4000, 4300, 4500],
+    "Cool": [0, 2400, 2900, 3300, 3700, 4000, 4300, 4500, 4500, 4500],
+    "Maximum": [0, 4500, 4500, 4500, 4500, 4500, 4500, 4500, 4500, 4500],
+}
+
+
+def retry(fn, *a):
+    last = None
+    for _ in range(4):
+        try:
+            return fn(*a)
+        except OSError as e:
+            last = e
+            time.sleep(0.25)
+    raise last
+
+
+def temp_color(t):
+    if t is None:
+        return QColor("#7f8c8d")
+    if t < 65:
+        return QColor("#27ae60")
+    if t < 80:
+        return QColor("#f39c12")
+    if t < 90:
+        return QColor("#e67e22")
+    return QColor("#e74c3c")
+
+
+def fmt(v, unit, digits=0):
+    if v is None:
+        return "—"
+    return ("%." + str(digits) + "f %s") % (v, unit)
+
+
+class Card(QFrame):
+    def __init__(self, title, color=None):
+        super().__init__()
+        self.setObjectName("card")
+        self.color = color
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(2)
+        self.title = QLabel(title)
+        self.title.setObjectName("cardTitle")
+        self.value = QLabel("—")
+        self.value.setObjectName("cardValue")
+        self.sub = QLabel("")
+        self.sub.setObjectName("cardSub")
+        lay.addWidget(self.title)
+        lay.addWidget(self.value)
+        lay.addWidget(self.sub)
+
+    def set(self, value, sub="", color=None):
+        self.value.setText(value)
+        self.sub.setText(sub)
+        c = color or self.color
+        if c:
+            self.value.setStyleSheet("color: %s" % c.name())
+
+
+class Chart(QWidget):
+    def __init__(self, title, series, lo, hi, unit):
+        super().__init__()
+        self.title, self.series, self.lo, self.hi, self.unit = title, series, lo, hi, unit
+        self.data = {k: deque(maxlen=HISTORY) for k, _ in series}
+        self.setMinimumHeight(170)
+
+    def push(self, key, v):
+        self.data[key].append(v)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        pal = self.palette()
+        r = self.rect().adjusted(46, 26, -12, -22)
+        p.setPen(pal.color(QPalette.WindowText))
+        f = p.font()
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(12, 18, self.title)
+        f.setBold(False)
+        p.setFont(f)
+        x = self.width() - 12
+        for key, label in reversed(self.series):
+            vals = [v for v in self.data[key] if v is not None]
+            txt = "%s %s" % (label, fmt(vals[-1], self.unit) if vals else "—")
+            w = p.fontMetrics().horizontalAdvance(txt)
+            x -= w
+            p.setPen(SERIES[key])
+            p.drawText(x, 18, txt)
+            x -= 16
+        hi = self.hi
+        for key, _ in self.series:
+            vals = [v for v in self.data[key] if v is not None]
+            if vals:
+                hi = max(hi, max(vals))
+        lo = self.lo
+        grid = QColor(pal.color(QPalette.WindowText))
+        grid.setAlpha(35)
+        p.setPen(QPen(grid, 1))
+        steps = 4
+        for i in range(steps + 1):
+            y = r.bottom() - i * r.height() / steps
+            p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
+            val = lo + (hi - lo) * i / steps
+            lab = QColor(pal.color(QPalette.WindowText))
+            lab.setAlpha(140)
+            p.setPen(lab)
+            p.drawText(QRectF(0, y - 8, r.left() - 6, 16), Qt.AlignRight | Qt.AlignVCenter, "%d" % val)
+            p.setPen(QPen(grid, 1))
+        for key, _ in self.series:
+            pts = list(self.data[key])
+            if len(pts) < 2:
+                continue
+            path = QPainterPath()
+            fill = QPainterPath()
+            started = False
+            n = HISTORY - 1
+            off = HISTORY - len(pts)
+            first_x = None
+            last_x = None
+            for i, v in enumerate(pts):
+                if v is None:
+                    continue
+                px = r.left() + (off + i) * r.width() / n
+                py = r.bottom() - (min(max(v, lo), hi) - lo) / (hi - lo) * r.height()
+                if not started:
+                    path.moveTo(px, py)
+                    fill.moveTo(px, r.bottom())
+                    fill.lineTo(px, py)
+                    first_x = px
+                    started = True
+                else:
+                    path.lineTo(px, py)
+                    fill.lineTo(px, py)
+                last_x = px
+            if not started:
+                continue
+            fill.lineTo(last_x, r.bottom())
+            fill.closeSubpath()
+            c = QColor(SERIES[key])
+            g = QLinearGradient(0, r.top(), 0, r.bottom())
+            c1 = QColor(c)
+            c1.setAlpha(70)
+            c2 = QColor(c)
+            c2.setAlpha(0)
+            g.setColorAt(0, c1)
+            g.setColorAt(1, c2)
+            p.fillPath(fill, QBrush(g))
+            p.setPen(QPen(c, 2))
+            p.drawPath(path)
+
+
+class CurveEditor(QWidget):
+    changed = Signal()
+
+    TMIN, TMAX = 30, 105
+
+    def __init__(self):
+        super().__init__()
+        self.points = [[0, 0, 0, 0] for _ in range(lc.CURVE_POINTS)]
+        self.ref = None
+        self.live_temp = None
+        self.live_point = None
+        self.drag = None
+        self.setMinimumHeight(300)
+        self.setMouseTracking(True)
+
+    def area(self):
+        return self.rect().adjusted(58, 16, -18, -34)
+
+    def to_px(self, t, rpm):
+        r = self.area()
+        x = r.left() + (t - self.TMIN) / (self.TMAX - self.TMIN) * r.width()
+        y = r.bottom() - rpm / lc.MAX_RPM * r.height()
+        return QPointF(x, y)
+
+    def from_px(self, pos):
+        r = self.area()
+        t = self.TMIN + (pos.x() - r.left()) / r.width() * (self.TMAX - self.TMIN)
+        rpm = (r.bottom() - pos.y()) / r.height() * lc.MAX_RPM
+        return t, rpm
+
+    def set_points(self, pts):
+        self.points = [list(p) for p in pts]
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        pal = self.palette()
+        r = self.area()
+        txt = QColor(pal.color(QPalette.WindowText))
+        grid = QColor(txt)
+        grid.setAlpha(35)
+        lab = QColor(txt)
+        lab.setAlpha(150)
+        for t in range(self.TMIN, self.TMAX + 1, 5):
+            a = self.to_px(t, 0)
+            p.setPen(QPen(grid, 1))
+            p.drawLine(QPointF(a.x(), r.top()), QPointF(a.x(), r.bottom()))
+            if t % 10 == 0:
+                p.setPen(lab)
+                p.drawText(QRectF(a.x() - 20, r.bottom() + 4, 40, 16), Qt.AlignCenter, "%d°" % t)
+        for rpm in range(0, lc.MAX_RPM + 1, 500):
+            a = self.to_px(self.TMIN, rpm)
+            p.setPen(QPen(grid, 1))
+            p.drawLine(QPointF(r.left(), a.y()), QPointF(r.right(), a.y()))
+            if rpm % 1000 == 0:
+                p.setPen(lab)
+                p.drawText(QRectF(0, a.y() - 8, r.left() - 6, 16), Qt.AlignRight | Qt.AlignVCenter, "%d" % rpm)
+        p.setPen(lab)
+        p.drawText(QRectF(r.left(), r.bottom() + 16, r.width(), 16), Qt.AlignCenter, "CPU temperature")
+        if self.live_temp is not None:
+            a = self.to_px(min(max(self.live_temp, self.TMIN), self.TMAX), 0)
+            p.setPen(QPen(temp_color(self.live_temp), 1.5, Qt.DashLine))
+            p.drawLine(QPointF(a.x(), r.top()), QPointF(a.x(), r.bottom()))
+        if self.ref:
+            self.draw_steps(p, self.ref, QColor(txt.red(), txt.green(), txt.blue(), 70), 1.5, Qt.DotLine, False)
+        self.draw_steps(p, self.points, ACCENT, 2.5, Qt.SolidLine, True)
+
+    def draw_steps(self, p, pts, color, width, style, handles):
+        path = QPainterPath()
+        prev_t = self.TMIN
+        for i, (t, _g, r1, r2) in enumerate(pts):
+            rpm = max(r1, r2)
+            a = self.to_px(prev_t, rpm)
+            b = self.to_px(min(t, self.TMAX), rpm)
+            if i == 0:
+                path.moveTo(a)
+            else:
+                path.lineTo(a)
+            path.lineTo(b)
+            prev_t = min(t, self.TMAX)
+        path.lineTo(self.to_px(self.TMAX, max(pts[-1][2], pts[-1][3])))
+        p.setPen(QPen(color, width, style))
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+        if not handles:
+            return
+        prev_t = self.TMIN
+        for i, (t, _g, r1, r2) in enumerate(pts):
+            c = self.to_px(min(t, self.TMAX), max(r1, r2))
+            active = i == self.live_point
+            p.setPen(QPen(QColor("white"), 2))
+            p.setBrush(QColor("#f1c40f") if active else ACCENT)
+            p.drawEllipse(c, 7 if active else 5.5, 7 if active else 5.5)
+            prev_t = t
+
+    def hit(self, pos):
+        best, bd = None, 14
+        for i, (t, _g, r1, r2) in enumerate(self.points):
+            c = self.to_px(min(t, self.TMAX), max(r1, r2))
+            d = ((c.x() - pos.x()) ** 2 + (c.y() - pos.y()) ** 2) ** 0.5
+            if d < bd:
+                best, bd = i, d
+        return best
+
+    def mousePressEvent(self, e):
+        self.drag = self.hit(e.position())
+
+    def mouseMoveEvent(self, e):
+        if self.drag is None:
+            self.setCursor(Qt.PointingHandCursor if self.hit(e.position()) is not None else Qt.ArrowCursor)
+            return
+        i = self.drag
+        t, rpm = self.from_px(e.position())
+        lo_t = self.points[i - 1][0] if i > 0 else 0
+        hi_t = self.points[i + 1][0] if i < len(self.points) - 1 else 127
+        t = int(round(min(max(t, lo_t), hi_t)))
+        self.points[i][0] = t
+        if i > 0:
+            lo_r = max(self.points[i - 1][2], self.points[i - 1][3])
+            hi_r = max(self.points[i + 1][2], self.points[i + 1][3]) if i < len(self.points) - 1 else lc.MAX_RPM
+            rpm = int(round(min(max(rpm, lo_r), hi_r) / 100.0)) * 100
+            self.points[i][2] = rpm
+            self.points[i][3] = rpm
+        self.update()
+        self.changed.emit()
+
+    def mouseReleaseEvent(self, _):
+        self.drag = None
+
+
+class Segmented(QWidget):
+    clicked = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.lay = QHBoxLayout(self)
+        self.lay.setContentsMargins(0, 0, 0, 0)
+        self.lay.setSpacing(6)
+        self.group = QButtonGroup(self)
+        self.group.setExclusive(True)
+        self.buttons = {}
+
+    def set_items(self, items):
+        for b in self.buttons.values():
+            self.group.removeButton(b)
+            b.deleteLater()
+        self.buttons = {}
+        for key, label in items:
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setObjectName("seg")
+            b.setMinimumHeight(38)
+            b.clicked.connect(lambda _=False, k=key: self.clicked.emit(k))
+            self.group.addButton(b)
+            self.lay.addWidget(b)
+            self.buttons[key] = b
+
+    def select(self, key):
+        b = self.buttons.get(key)
+        if b and not b.isChecked():
+            b.setChecked(True)
+
+
+class Switch(QAbstractButton):
+    def __init__(self):
+        super().__init__()
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(46, 26)
+
+    def sizeHint(self):
+        return QSize(46, 26)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        on = self.isChecked()
+        track = ACCENT if on else QColor(self.palette().color(QPalette.WindowText))
+        if not on:
+            track.setAlpha(70)
+        if not self.isEnabled():
+            track.setAlpha(40)
+        p.setPen(Qt.NoPen)
+        p.setBrush(track)
+        p.drawRoundedRect(QRectF(0, 3, 46, 20), 10, 10)
+        p.setBrush(QColor("white"))
+        x = 24 if on else 2
+        p.drawEllipse(QRectF(x, 1, 24, 24).adjusted(2, 2, -2, -2))
+
+
+def section(title):
+    l = QLabel(title)
+    l.setObjectName("section")
+    return l
+
+
+def page(title, subtitle=""):
+    outer = QScrollArea()
+    outer.setWidgetResizable(True)
+    outer.setFrameShape(QFrame.NoFrame)
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(28, 22, 28, 22)
+    lay.setSpacing(14)
+    h = QLabel(title)
+    h.setObjectName("pageTitle")
+    lay.addWidget(h)
+    if subtitle:
+        s = QLabel(subtitle)
+        s.setObjectName("pageSub")
+        s.setWordWrap(True)
+        lay.addWidget(s)
+    outer.setWidget(w)
+    return outer, lay
+
+
+class Dashboard:
+    def __init__(self, win):
+        self.win = win
+        self.widget, lay = page("Dashboard", "Live sensors from the embedded controller, CPU package and battery.")
+        self.profile = Segmented()
+        self.profile.clicked.connect(win.set_profile)
+        lay.addWidget(section("Power mode"))
+        lay.addWidget(self.profile)
+        grid = QGridLayout()
+        grid.setSpacing(12)
+        self.cards = {
+            "cpu": Card("CPU"),
+            "gpu": Card("GPU"),
+            "fans": Card("Fans", SERIES["fan1"]),
+            "pkg": Card("CPU package power", SERIES["pkg"]),
+            "clock": Card("CPU clock"),
+            "bat": Card("Battery", SERIES["bat"]),
+        }
+        for i, k in enumerate(["cpu", "gpu", "fans", "pkg", "clock", "bat"]):
+            grid.addWidget(self.cards[k], i // 3, i % 3)
+        lay.addLayout(grid)
+        self.temps = Chart("Temperatures", [("cpu", "CPU"), ("gpu", "GPU")], 30, 100, "°C")
+        self.fans = Chart("Fan speed", [("fan1", "Fan 1"), ("fan2", "Fan 2")], 0, lc.MAX_RPM, "rpm")
+        self.power = Chart("Power", [("pkg", "CPU package"), ("bat", "Battery")], 0, 60, "W")
+        for c in (self.temps, self.fans, self.power):
+            fr = QFrame()
+            fr.setObjectName("card")
+            fl = QVBoxLayout(fr)
+            fl.setContentsMargins(4, 6, 4, 4)
+            fl.addWidget(c)
+            lay.addWidget(fr)
+        lay.addStretch(1)
+
+    def refresh_profiles(self):
+        self.profile.set_items([(c, lc.PROFILE_LABELS.get(c, c.title())) for c in lc.profile_choices()])
+
+    def update(self, s):
+        self.profile.select(s["profile"])
+        self.cards["cpu"].set(fmt(s["cpu"], "°C"), "Package temperature", temp_color(s["cpu"]))
+        self.cards["gpu"].set(fmt(s["gpu"], "°C"), "Embedded controller sensor", temp_color(s["gpu"]))
+        f1, f2 = s["fan1"], s["fan2"]
+        self.cards["fans"].set("%s / %s" % (f1 if f1 is not None else "—", f2 if f2 is not None else "—"),
+                               "RPM")
+        self.cards["pkg"].set(fmt(s["pkg"], "W", 1),
+                              "PL1 %s · PL2 %s" % (fmt(s["pl1"], "W"), fmt(s["pl2"], "W")))
+        fr = s["freqs"]
+        if fr:
+            self.cards["clock"].set("%.2f GHz" % (max(fr) / 1000), "Average %.2f GHz" % (sum(fr) / len(fr) / 1000))
+        b = s["bat"]
+        if b:
+            state = "on AC" if s["ac"] else "on battery"
+            self.cards["bat"].set("%d%%" % (b["capacity"] or 0), "%s · %s · %.1f W" % (b["status"], state, b["watts"]))
+        self.temps.push("cpu", s["cpu"])
+        self.temps.push("gpu", s["gpu"])
+        self.fans.push("fan1", f1)
+        self.fans.push("fan2", f2)
+        self.power.push("pkg", s["pkg"])
+        self.power.push("bat", b["watts"] if b else None)
+        for c in (self.temps, self.fans, self.power):
+            if self.widget.isVisible():
+                c.update()
+
+
+class PowerPage:
+    def __init__(self, win):
+        self.win = win
+        self.widget, lay = page("Power", "Power modes are the firmware's presets. Custom mode unlocks the limits below; "
+                                         "they are saved and re-applied whenever you enter Custom.")
+        self.profile = Segmented()
+        self.profile.clicked.connect(win.set_profile)
+        lay.addWidget(section("Power mode"))
+        lay.addWidget(self.profile)
+        self.restore = QCheckBox("Restore the last selected mode at boot")
+        self.restore.toggled.connect(self.on_restore)
+        lay.addWidget(self.restore)
+        lay.addWidget(section("Custom mode limits"))
+        self.note = QLabel()
+        self.note.setObjectName("hint")
+        self.note.setWordWrap(True)
+        lay.addWidget(self.note)
+        box = QFrame()
+        box.setObjectName("card")
+        g = QGridLayout(box)
+        g.setContentsMargins(16, 14, 16, 14)
+        g.setHorizontalSpacing(14)
+        g.setVerticalSpacing(10)
+        self.rows = {}
+        row = 0
+        for name, label, unit in lc.LIMIT_ATTRS:
+            info = lc.limit_info(name)
+            if not info or info["min"] is None:
+                continue
+            l = QLabel(label)
+            sl = QSlider(Qt.Horizontal)
+            sl.setRange(info["min"], info["max"])
+            sl.setSingleStep(info["step"])
+            sp = QSpinBox()
+            sp.setRange(info["min"], info["max"])
+            sp.setSuffix(" " + unit)
+            sp.setMinimumWidth(90)
+            sl.valueChanged.connect(sp.setValue)
+            sp.valueChanged.connect(sl.setValue)
+            rng = QLabel("%d–%d" % (info["min"], info["max"]))
+            rng.setObjectName("hint")
+            g.addWidget(l, row, 0)
+            g.addWidget(sl, row, 1)
+            g.addWidget(sp, row, 2)
+            g.addWidget(rng, row, 3)
+            self.rows[name] = (sp, info)
+            row += 1
+        g.setColumnStretch(1, 1)
+        lay.addWidget(box)
+        btns = QHBoxLayout()
+        self.apply_btn = QPushButton("Apply to Custom mode")
+        self.apply_btn.setObjectName("primary")
+        self.apply_btn.clicked.connect(self.apply)
+        reset = QPushButton("Load firmware defaults")
+        reset.clicked.connect(self.defaults)
+        reload_ = QPushButton("Reload current values")
+        reload_.clicked.connect(self.load)
+        btns.addWidget(self.apply_btn)
+        btns.addWidget(reset)
+        btns.addWidget(reload_)
+        btns.addStretch(1)
+        lay.addLayout(btns)
+        lay.addStretch(1)
+        self.load()
+
+    def refresh_profiles(self):
+        self.profile.set_items([(c, lc.PROFILE_LABELS.get(c, c.title())) for c in lc.profile_choices()])
+        self.restore.blockSignals(True)
+        self.restore.setChecked(bool(self.win.cfg.get("restore_profile")))
+        self.restore.blockSignals(False)
+
+    def on_restore(self, on):
+        self.win.cfg["restore_profile"] = on
+        self.win.cfg["profile"] = lc.get_profile()
+        self.win.save()
+
+    def load(self):
+        saved = self.win.cfg.get("limits", {})
+        for name, (sp, _info) in self.rows.items():
+            cur = lc.limit_info(name)
+            sp.setValue(saved.get(name, cur["value"] if cur else 0))
+
+    def defaults(self):
+        for name, (sp, info) in self.rows.items():
+            if info["default"] is not None:
+                sp.setValue(info["default"])
+
+    def apply(self):
+        values = {n: sp.value() for n, (sp, _i) in self.rows.items()}
+        self.win.cfg["limits"] = values
+        self.win.save()
+        if lc.get_profile() != "custom":
+            r = QMessageBox.question(self.widget, "Switch to Custom mode",
+                                     "These limits only take effect in Custom mode. Switch to Custom now?")
+            if r != QMessageBox.Yes:
+                self.win.status("Limits saved; they apply the next time you enter Custom mode")
+                return
+            self.win.set_profile("custom")
+        errors = []
+        for n, v in values.items():
+            try:
+                retry(lc.set_limit, n, v)
+            except OSError as e:
+                errors.append("%s: %s" % (n, e.strerror or e))
+        if errors:
+            QMessageBox.warning(self.widget, "Some limits were rejected", "\n".join(errors))
+        else:
+            self.win.status("Custom limits applied")
+
+    def update(self, s):
+        self.profile.select(s["profile"])
+        custom = s["profile"] == "custom"
+        self.note.setText("Active now." if custom else
+                          "Not active: the firmware only accepts these in Custom mode. "
+                          "Applying will offer to switch.")
+
+
+class FanPage:
+    def __init__(self, win):
+        self.win = win
+        self.widget, lay = page("Fans", "The fan curve lives in the embedded controller. Each power mode has its own; "
+                                        "the firmware replaces it when the mode changes, and LOQ Control puts yours back.")
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Curve for"))
+        self.combo = QComboBox()
+        self.combo.currentIndexChanged.connect(self.load)
+        top.addWidget(self.combo)
+        self.enabled = QCheckBox("Use this custom curve in this mode")
+        top.addSpacing(12)
+        top.addWidget(self.enabled)
+        top.addStretch(1)
+        lay.addLayout(top)
+        frame = QFrame()
+        frame.setObjectName("card")
+        fl = QVBoxLayout(frame)
+        fl.setContentsMargins(8, 8, 8, 8)
+        self.editor = CurveEditor()
+        self.editor.changed.connect(self.sync_table)
+        fl.addWidget(self.editor)
+        legend = QLabel("Solid: your curve (drag the points) · dotted: firmware curve · dashed: current CPU temperature")
+        legend.setObjectName("hint")
+        legend.setWordWrap(True)
+        fl.addWidget(legend)
+        lay.addWidget(frame)
+        pre = QHBoxLayout()
+        pre.addWidget(QLabel("Presets"))
+        b = QPushButton("Firmware")
+        b.clicked.connect(self.firmware_preset)
+        pre.addWidget(b)
+        for name in PRESETS:
+            b = QPushButton(name)
+            b.clicked.connect(lambda _=False, n=name: self.preset(n))
+            pre.addWidget(b)
+        pre.addStretch(1)
+        lay.addLayout(pre)
+        table = QFrame()
+        table.setObjectName("card")
+        g = QGridLayout(table)
+        g.setContentsMargins(16, 12, 16, 12)
+        g.setHorizontalSpacing(10)
+        g.setVerticalSpacing(6)
+        for c, h in enumerate(["Step", "Up to CPU", "Up to GPU", "Fan 1", "Fan 2"]):
+            l = QLabel(h)
+            l.setObjectName("hint")
+            g.addWidget(l, 0, c)
+        self.spins = []
+        for i in range(lc.CURVE_POINTS):
+            g.addWidget(QLabel(str(i + 1)), i + 1, 0)
+            row = []
+            for c, (lo, hi, suf, step) in enumerate([(0, 127, " °C", 1), (0, 127, " °C", 1),
+                                                    (0, lc.MAX_RPM, " rpm", 100), (0, lc.MAX_RPM, " rpm", 100)]):
+                sp = QSpinBox()
+                sp.setRange(lo, hi)
+                sp.setSingleStep(step)
+                sp.setSuffix(suf)
+                sp.valueChanged.connect(self.from_table)
+                g.addWidget(sp, i + 1, c + 1)
+                row.append(sp)
+            self.spins.append(row)
+        self.link = QCheckBox("Keep both fans at the same speed")
+        self.link.setChecked(True)
+        g.addWidget(self.link, lc.CURVE_POINTS + 1, 0, 1, 5)
+        lay.addWidget(table)
+        btns = QHBoxLayout()
+        ap = QPushButton("Save and apply")
+        ap.setObjectName("primary")
+        ap.clicked.connect(self.apply)
+        rv = QPushButton("Revert to firmware curve")
+        rv.clicked.connect(self.revert)
+        btns.addWidget(ap)
+        btns.addWidget(rv)
+        btns.addStretch(1)
+        lay.addLayout(btns)
+        lay.addStretch(1)
+        self._sync = False
+
+    def refresh_profiles(self):
+        cur = lc.get_profile()
+        self.combo.blockSignals(True)
+        self.combo.clear()
+        for c in lc.profile_choices():
+            self.combo.addItem(lc.PROFILE_LABELS.get(c, c.title()), c)
+        i = self.combo.findData(cur)
+        self.combo.setCurrentIndex(max(i, 0))
+        self.combo.blockSignals(False)
+        self.load()
+
+    def profile(self):
+        return self.combo.currentData()
+
+    def firmware_curve(self, prof):
+        fw = lc.load_firmware_curves().get(prof)
+        if fw:
+            return fw
+        entry = self.win.cfg.get("curves", {}).get(prof, {})
+        if prof == lc.get_profile() and not entry.get("enabled"):
+            return lc.read_curve()
+        return None
+
+    def load(self):
+        prof = self.profile()
+        if not prof:
+            return
+        entry = self.win.cfg.get("curves", {}).get(prof)
+        fw = self.firmware_curve(prof)
+        self.editor.ref = fw
+        pts = entry["points"] if entry and entry.get("points") else (fw or lc.read_curve())
+        self.enabled.setChecked(bool(entry and entry.get("enabled")))
+        if pts:
+            self.editor.set_points(pts)
+            self.sync_table()
+
+    def sync_table(self):
+        self._sync = True
+        for row, pt in zip(self.spins, self.editor.points):
+            for sp, v in zip(row, pt):
+                sp.setValue(v)
+        self._sync = False
+
+    def from_table(self):
+        if self._sync:
+            return
+        pts = [[sp.value() for sp in row] for row in self.spins]
+        if self.link.isChecked():
+            for i, row in enumerate(self.spins):
+                if row[3].hasFocus():
+                    pts[i][2] = pts[i][3]
+                else:
+                    pts[i][3] = pts[i][2]
+            self._sync = True
+            for row, pt in zip(self.spins, pts):
+                row[2].setValue(pt[2])
+                row[3].setValue(pt[3])
+            self._sync = False
+        self.editor.set_points(pts)
+
+    def preset(self, name):
+        rpm = PRESETS[name]
+        self.editor.set_points([[PRESET_T[i], PRESET_G[i], rpm[i], rpm[i]] for i in range(lc.CURVE_POINTS)])
+        self.sync_table()
+        self.enabled.setChecked(True)
+
+    def firmware_preset(self):
+        fw = self.firmware_curve(self.profile())
+        if fw:
+            self.editor.set_points(fw)
+            self.sync_table()
+        else:
+            self.win.status("The firmware curve for this mode is captured the first time you use the mode")
+
+    def apply(self):
+        pts = [list(p) for p in self.editor.points]
+        err = lc.validate_curve(pts)
+        if err:
+            QMessageBox.warning(self.widget, "Invalid curve", err)
+            return
+        prof = self.profile()
+        self.win.cfg.setdefault("curves", {})[prof] = {"enabled": self.enabled.isChecked(), "points": pts}
+        self.win.save()
+        if prof != lc.get_profile():
+            self.win.status("Saved. It applies when you switch to %s" % self.combo.currentText())
+            return
+        target = pts if self.enabled.isChecked() else self.firmware_curve(prof)
+        if not target:
+            self.win.status("Saved")
+            return
+        try:
+            retry(lc.write_curve, target)
+            self.win.status("Fan curve applied" if self.enabled.isChecked() else "Firmware curve restored")
+        except OSError as e:
+            QMessageBox.warning(self.widget, "Fan curve rejected", str(e))
+
+    def revert(self):
+        prof = self.profile()
+        entry = self.win.cfg.setdefault("curves", {}).get(prof)
+        if entry:
+            entry["enabled"] = False
+        self.win.save()
+        fw = self.firmware_curve(prof)
+        self.enabled.setChecked(False)
+        if fw:
+            self.editor.set_points(fw)
+            self.sync_table()
+            if prof == lc.get_profile():
+                try:
+                    retry(lc.write_curve, fw)
+                except OSError as e:
+                    QMessageBox.warning(self.widget, "Fan curve rejected", str(e))
+        self.win.status("Using the firmware curve")
+
+    def update(self, s):
+        self.editor.live_temp = s["cpu"]
+        if self.widget.isVisible():
+            self.editor.update()
+
+
+class DevicePage:
+    def __init__(self, win):
+        self.win = win
+        self.widget, lay = page("Device", "Battery, keyboard, display and lighting. Settings are remembered and restored at boot.")
+        self.switches = {}
+        groups = {"battery": "Battery", "input": "Keyboard and touchpad", "display": "Display and camera"}
+        for key, title in groups.items():
+            items = [t for t in lc.TOGGLES if t[4] == key and os.path.exists(os.path.join(t[1], t[0]))]
+            if not items:
+                continue
+            lay.addWidget(section(title))
+            box = QFrame()
+            box.setObjectName("card")
+            v = QVBoxLayout(box)
+            v.setContentsMargins(16, 8, 16, 8)
+            for i, (name, _base, label, desc, _g) in enumerate(items):
+                if i:
+                    line = QFrame()
+                    line.setObjectName("sep")
+                    line.setFixedHeight(1)
+                    v.addWidget(line)
+                h = QHBoxLayout()
+                t = QVBoxLayout()
+                t.setSpacing(0)
+                a = QLabel(label)
+                a.setObjectName("rowTitle")
+                b = QLabel(desc)
+                b.setObjectName("hint")
+                t.addWidget(a)
+                t.addWidget(b)
+                h.addLayout(t, 1)
+                sw = Switch()
+                sw.toggled.connect(lambda on, n=name: self.toggle(n, on))
+                h.addWidget(sw)
+                v.addLayout(h)
+                self.switches[name] = sw
+            lay.addWidget(box)
+        self.leds = {}
+        led_list = lc.leds()
+        if led_list:
+            lay.addWidget(section("Lighting"))
+            box = QFrame()
+            box.setObjectName("card")
+            g = QGridLayout(box)
+            g.setContentsMargins(16, 12, 16, 12)
+            seen = set()
+            for row, (name, label, d) in enumerate(led_list):
+                mx = lc.read_int(os.path.join(d, "max_brightness"), 1) or 1
+                g.addWidget(QLabel(label), row, 0)
+                if mx > 1:
+                    sl = QSlider(Qt.Horizontal)
+                    sl.setRange(0, mx)
+                    sl.setPageStep(1)
+                    sl.setTickPosition(QSlider.TicksBelow)
+                    sl.valueChanged.connect(lambda v, n=name: self.led(n, v))
+                    g.addWidget(sl, row, 1)
+                    self.leds[name] = sl
+                else:
+                    sw = Switch()
+                    sw.toggled.connect(lambda on, n=name: self.led(n, int(on)))
+                    g.addWidget(sw, row, 1, Qt.AlignRight)
+                    self.leds[name] = sw
+            g.setColumnStretch(1, 1)
+            lay.addWidget(box)
+        lay.addStretch(1)
+        self.load()
+
+    def load(self):
+        for name, sw in self.switches.items():
+            v = lc.read(lc.toggle_path(name))
+            sw.blockSignals(True)
+            sw.setChecked(v == "1")
+            sw.setEnabled(v is not None)
+            sw.blockSignals(False)
+        for name, w in self.leds.items():
+            v = lc.read_int(os.path.join("/sys/class/leds", name, "brightness"), 0)
+            w.blockSignals(True)
+            if isinstance(w, QSlider):
+                w.setValue(v)
+            else:
+                w.setChecked(v > 0)
+            w.blockSignals(False)
+
+    def toggle(self, name, on):
+        try:
+            retry(lc.write, lc.toggle_path(name), int(on))
+        except OSError as e:
+            QMessageBox.warning(self.widget, "Could not change setting", "%s: %s" % (name, e.strerror or e))
+            self.load()
+            return
+        self.win.cfg.setdefault("toggles", {})[name] = int(on)
+        other = lc.EXCLUSIVE.get(name)
+        if on and other and other in self.switches:
+            self.win.cfg["toggles"][other] = 0
+        self.win.save()
+        QTimer.singleShot(300, self.load)
+
+    def led(self, name, value):
+        try:
+            lc.write(os.path.join("/sys/class/leds", name, "brightness"), value)
+        except OSError as e:
+            self.win.status("%s: %s" % (name, e.strerror or e))
+            return
+        self.win.cfg.setdefault("leds", {})[name] = value
+        self.win.save()
+
+    def update(self, s):
+        pass
+
+
+class SettingsPage:
+    AUTOSTART = os.path.expanduser("~/.config/autostart/loq-control.desktop")
+
+    def __init__(self, win):
+        self.win = win
+        self.widget, lay = page("Settings")
+        lay.addWidget(section("App"))
+        self.autostart = QCheckBox("Start in the system tray when I log in")
+        self.autostart.setChecked(os.path.exists(self.AUTOSTART))
+        self.autostart.toggled.connect(self.set_autostart)
+        lay.addWidget(self.autostart)
+        self.tray_close = QCheckBox("Closing the window keeps LOQ Control in the tray")
+        self.tray_close.setChecked(win.ui.get("close_to_tray", True))
+        self.tray_close.toggled.connect(lambda v: win.set_ui("close_to_tray", v))
+        lay.addWidget(self.tray_close)
+        lay.addWidget(section("Status"))
+        self.info = QLabel()
+        self.info.setWordWrap(True)
+        self.info.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        box = QFrame()
+        box.setObjectName("card")
+        v = QVBoxLayout(box)
+        v.setContentsMargins(16, 12, 16, 12)
+        v.addWidget(self.info)
+        lay.addWidget(box)
+        lay.addStretch(1)
+        self.refresh()
+
+    def set_autostart(self, on):
+        if on:
+            os.makedirs(os.path.dirname(self.AUTOSTART), exist_ok=True)
+            src = "/usr/share/loq-control/loq-control-autostart.desktop"
+            with open(src) as f, open(self.AUTOSTART, "w") as o:
+                o.write(f.read())
+        elif os.path.exists(self.AUTOSTART):
+            os.remove(self.AUTOSTART)
+
+    def refresh(self):
+        def svc(name):
+            try:
+                return subprocess.run(["systemctl", "is-active", name], capture_output=True, text=True).stdout.strip()
+            except OSError:
+                return "unknown"
+        vendor = lc.read("/sys/class/dmi/id/sys_vendor", "")
+        product = lc.read("/sys/class/dmi/id/product_version", "")
+        bios = lc.read("/sys/class/dmi/id/bios_version", "")
+        drv = "loaded" if os.path.exists(os.path.join(lc.LEGION, "fancurve")) else "not loaded"
+        writable = os.access(os.path.join(lc.LEGION, "fancurve"), os.W_OK)
+        self.info.setText(
+            "Machine: %s %s (BIOS %s)\nFan driver: %s\nBackground service (loqd): %s\n"
+            "Write access: %s\nPower mode interface: %s\nSettings file: %s" % (
+                vendor, product, bios, drv, svc("loqd.service"),
+                "yes" if writable else "no — make sure loqd is running and you are in the '%s' group" % lc.GROUP,
+                lc.profile_path(), lc.CONFIG))
+
+    def update(self, s):
+        pass
+
+
+class Window(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("LOQ Control")
+        self.setWindowIcon(QIcon.fromTheme("computer-laptop"))
+        self.resize(1060, 780)
+        self.cfg = lc.load_config()
+        self.ui = {}
+        self.ui_path = os.path.expanduser("~/.config/loq-control.json")
+        self.ui = lc.load_json(self.ui_path, {"close_to_tray": True})
+        self.last_energy = None
+        self.last_time = None
+        self.max_energy = lc.rapl_max_energy() or (1 << 32)
+        self.quitting = False
+
+        central = QWidget()
+        h = QHBoxLayout(central)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+        side = QFrame()
+        side.setObjectName("side")
+        side.setFixedWidth(210)
+        sv = QVBoxLayout(side)
+        sv.setContentsMargins(12, 18, 12, 12)
+        brand = QLabel("LOQ Control")
+        brand.setObjectName("brand")
+        sv.addWidget(brand)
+        model = QLabel(lc.read("/sys/class/dmi/id/product_version", "Lenovo"))
+        model.setObjectName("hint")
+        sv.addWidget(model)
+        sv.addSpacing(14)
+        self.nav = QListWidget()
+        self.nav.setObjectName("nav")
+        sv.addWidget(self.nav, 1)
+        self.side_temp = QLabel()
+        self.side_temp.setObjectName("hint")
+        self.side_temp.setWordWrap(True)
+        sv.addWidget(self.side_temp)
+        h.addWidget(side)
+        self.stack = QStackedWidget()
+        h.addWidget(self.stack, 1)
+        self.setCentralWidget(central)
+        self.statusBar().setSizeGripEnabled(False)
+
+        self.dash = Dashboard(self)
+        self.power = PowerPage(self)
+        self.fans = FanPage(self)
+        self.device = DevicePage(self)
+        self.settings = SettingsPage(self)
+        self.pages = [("Dashboard", "view-statistics", self.dash), ("Power", "battery-profile-performance", self.power),
+                      ("Fans", "fan", self.fans), ("Device", "computer-laptop", self.device),
+                      ("Settings", "configure", self.settings)]
+        for name, icon, pg in self.pages:
+            it = QListWidgetItem(QIcon.fromTheme(icon, QIcon.fromTheme("preferences-system")), name)
+            it.setSizeHint(QSize(0, 40))
+            self.nav.addItem(it)
+            self.stack.addWidget(pg.widget)
+        self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.nav.currentRowChanged.connect(lambda i: self.pages[i][2] is self.settings and self.settings.refresh())
+        self.nav.setCurrentRow(0)
+
+        self.tray = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.build_tray()
+        self.known_profile = None
+        self.refresh_profiles()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(1000)
+        self.tick()
+
+    def build_tray(self):
+        self.tray = QSystemTrayIcon(self)
+        self.tray_menu = QMenu()
+        self.tray_menu.addAction("Open LOQ Control", self.show_window)
+        self.tray_menu.addSeparator()
+        self.tray_profiles = QActionGroup(self)
+        self.tray_profiles.setExclusive(True)
+        self.tray_profile_actions = {}
+        self.tray_sep = self.tray_menu.addSeparator()
+        self.max_fans = QAction("Maximum fans", self)
+        self.max_fans.setCheckable(True)
+        self.max_fans.toggled.connect(self.toggle_max_fans)
+        self.tray_menu.addAction(self.max_fans)
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction("Quit", self.quit)
+        self.tray.setContextMenu(self.tray_menu)
+        self.tray.activated.connect(lambda r: r == QSystemTrayIcon.Trigger and self.toggle_window())
+        self.tray.show()
+
+    def refresh_tray_profiles(self):
+        if not self.tray:
+            return
+        for a in self.tray_profile_actions.values():
+            self.tray_menu.removeAction(a)
+            self.tray_profiles.removeAction(a)
+        self.tray_profile_actions = {}
+        for c in lc.profile_choices():
+            a = QAction(lc.PROFILE_LABELS.get(c, c.title()), self)
+            a.setCheckable(True)
+            a.triggered.connect(lambda _=False, k=c: self.set_profile(k))
+            self.tray_profiles.addAction(a)
+            self.tray_menu.insertAction(self.tray_sep, a)
+            self.tray_profile_actions[c] = a
+
+    def refresh_profiles(self):
+        self.dash.refresh_profiles()
+        self.power.refresh_profiles()
+        self.fans.refresh_profiles()
+        self.refresh_tray_profiles()
+
+    def toggle_max_fans(self, on):
+        prof = lc.get_profile()
+        try:
+            if on:
+                rpm = PRESETS["Maximum"]
+                retry(lc.write_curve, [[PRESET_T[i], PRESET_G[i], rpm[i], rpm[i]] for i in range(lc.CURVE_POINTS)])
+                self.status("Fans at maximum until you turn this off or change mode")
+            else:
+                entry = self.cfg.get("curves", {}).get(prof)
+                target = entry["points"] if entry and entry.get("enabled") else self.fans.firmware_curve(prof)
+                if target:
+                    retry(lc.write_curve, target)
+                self.status("Fans back to the %s curve" % lc.PROFILE_LABELS.get(prof, prof))
+        except OSError as e:
+            self.status("Fan curve write failed: %s" % e)
+
+    def tray_icon(self, t):
+        pm = QPixmap(64, 64)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(temp_color(t))
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(QRectF(2, 2, 60, 60), 14, 14)
+        p.setPen(QColor("white"))
+        f = QFont()
+        f.setBold(True)
+        f.setPixelSize(34)
+        p.setFont(f)
+        p.drawText(pm.rect(), Qt.AlignCenter, "%d" % t if t is not None else "?")
+        p.end()
+        return QIcon(pm)
+
+    def show_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def toggle_window(self):
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self.show_window()
+
+    def closeEvent(self, e):
+        if self.tray and self.ui.get("close_to_tray", True) and not self.quitting:
+            e.ignore()
+            self.hide()
+        else:
+            e.accept()
+            QApplication.quit()
+
+    def quit(self):
+        self.quitting = True
+        QApplication.quit()
+
+    def set_ui(self, k, v):
+        self.ui[k] = v
+        try:
+            lc.save_json(self.ui_path, self.ui)
+        except OSError:
+            pass
+
+    def save(self):
+        try:
+            lc.save_config(self.cfg)
+        except OSError as e:
+            self.status("Could not save settings: %s" % e)
+
+    def status(self, msg):
+        self.statusBar().showMessage(msg, 6000)
+        if self.tray and not self.isVisible():
+            self.tray.showMessage("LOQ Control", msg, QSystemTrayIcon.Information, 3000)
+
+    def set_profile(self, name):
+        if name == lc.get_profile():
+            return
+        try:
+            retry(lc.set_profile, name)
+        except OSError as e:
+            QMessageBox.warning(self, "Could not change power mode", str(e))
+            return
+        if self.max_fans.isChecked() if self.tray else False:
+            self.max_fans.blockSignals(True)
+            self.max_fans.setChecked(False)
+            self.max_fans.blockSignals(False)
+        self.cfg["profile"] = name
+        self.save()
+        self.status("Power mode: %s" % lc.PROFILE_LABELS.get(name, name))
+        self.tick()
+
+    def tick(self):
+        now = time.monotonic()
+        e = lc.rapl_energy()
+        pkg = None
+        if e is not None and self.last_energy is not None:
+            d = e - self.last_energy
+            if d < 0:
+                d += self.max_energy
+            pkg = d / 1e6 / (now - self.last_time)
+        self.last_energy, self.last_time = e, now
+        f1, f2 = lc.fan_rpms()
+        prof = lc.get_profile()
+        pl1 = lc.read_int(os.path.join(lc.FWA, "ppt_pl1_spl", "current_value")) if prof == "custom" else None
+        pl2 = lc.read_int(os.path.join(lc.FWA, "ppt_pl2_sppt", "current_value")) if prof == "custom" else None
+        if pl1 is None:
+            v = lc.read_int("/sys/class/powercap/intel-rapl-mmio:0/constraint_0_power_limit_uw")
+            pl1 = v / 1e6 if v else None
+            v = lc.read_int("/sys/class/powercap/intel-rapl-mmio:0/constraint_1_power_limit_uw")
+            pl2 = v / 1e6 if v else None
+        s = {
+            "profile": prof,
+            "cpu": lc.cpu_temp(),
+            "gpu": lc.gpu_temp(),
+            "fan1": f1,
+            "fan2": f2,
+            "pkg": pkg,
+            "pl1": pl1,
+            "pl2": pl2,
+            "freqs": lc.cpu_freqs(),
+            "bat": lc.battery(),
+            "ac": lc.ac_online(),
+        }
+        if prof != self.known_profile:
+            if self.known_profile is not None:
+                i = self.fans.combo.findData(prof)
+                if i >= 0:
+                    self.fans.combo.setCurrentIndex(i)
+                QTimer.singleShot(1500, self.fans.load)
+            self.known_profile = prof
+        for _n, _i, pg in self.pages:
+            pg.update(s)
+        label = lc.PROFILE_LABELS.get(prof, prof or "?")
+        self.side_temp.setText("%s\nCPU %s  ·  GPU %s" % (label, fmt(s["cpu"], "°C"), fmt(s["gpu"], "°C")))
+        if self.tray:
+            self.tray.setIcon(self.tray_icon(s["cpu"]))
+            self.tray.setToolTip("LOQ Control — %s\nCPU %s · GPU %s\nFans %s / %s rpm\nPackage %s" % (
+                label, fmt(s["cpu"], "°C"), fmt(s["gpu"], "°C"), f1, f2, fmt(pkg, "W", 1)))
+            for k, a in self.tray_profile_actions.items():
+                a.setChecked(k == prof)
+
+
+STYLE = """
+#side { background: palette(alternate-base); border-right: 1px solid rgba(127,127,127,0.18); }
+#brand { font-size: 19px; font-weight: 700; }
+#nav { background: transparent; border: none; font-size: 14px; outline: 0; }
+#nav::item { padding: 6px 10px; border-radius: 8px; margin: 2px 0; }
+#nav::item:selected { background: rgba(226,35,26,0.16); color: palette(window-text); border-left: 3px solid #e2231a; }
+#nav::item:hover:!selected { background: rgba(127,127,127,0.12); }
+#pageTitle { font-size: 24px; font-weight: 700; }
+#pageSub, #hint { color: rgba(127,127,127,1); }
+#section { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: rgba(127,127,127,1); margin-top: 6px; }
+#card { background: palette(base); border: 1px solid rgba(127,127,127,0.18); border-radius: 12px; }
+#cardTitle { color: rgba(127,127,127,1); font-size: 12px; font-weight: 600; }
+#cardValue { font-size: 26px; font-weight: 700; }
+#cardSub { color: rgba(127,127,127,1); font-size: 11px; }
+#rowTitle { font-size: 14px; font-weight: 600; }
+#sep { background: rgba(127,127,127,0.18); }
+QPushButton { padding: 7px 14px; border-radius: 8px; }
+QPushButton#primary { background: #e2231a; color: white; font-weight: 600; border: none; }
+QPushButton#primary:hover { background: #f0362d; }
+QPushButton#seg { border-radius: 9px; font-weight: 600; }
+QPushButton#seg:checked { background: #e2231a; color: white; border: none; }
+"""
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("LOQ Control")
+    app.setDesktopFileName("loq-control")
+    app.setQuitOnLastWindowClosed(False)
+    app.setStyleSheet(STYLE)
+    w = Window()
+    if "--tray" in sys.argv and w.tray:
+        w.hide()
+    else:
+        w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
