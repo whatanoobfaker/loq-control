@@ -4,6 +4,7 @@ import json
 import os
 import select
 import signal
+import subprocess
 import sys
 import time
 
@@ -183,7 +184,7 @@ class ThermalController:
             self.source = source
             log("power source: %s, firmware PL1 %.0f W" % (source, self.ceiling() or 0))
         t = lc.thermal_settings(cfg, source)
-        if not t.get("enabled"):
+        if lc.thermal_mode(cfg) != "target" or not t.get("enabled"):
             if self.active:
                 self.restore()
             return
@@ -217,6 +218,17 @@ class ThermalController:
                     log("rapl %s: %s" % (d, e))
             self.last_write = w
         self.status(t)
+
+
+def sync_thermald(cfg):
+    want = lc.thermal_mode(cfg) == "dtt"
+    active = subprocess.run(["systemctl", "is-active", "--quiet", "thermald.service"]).returncode == 0
+    if want and not active:
+        r = subprocess.run(["systemctl", "start", "thermald.service"], capture_output=True, text=True)
+        log("thermald start: %s" % (r.stderr.strip() or "ok"))
+    elif not want and active:
+        subprocess.run(["systemctl", "stop", "thermald.service"])
+        log("thermald stopped")
 
 
 def on_profile(cfg, profile):
@@ -271,6 +283,7 @@ def main():
     thermal = ThermalController()
     thermal.capture_base()
     cfg = lc.load_config()
+    sync_thermald(cfg)
     last = time.monotonic()
 
     def shutdown(*_):
@@ -312,6 +325,9 @@ def main():
         if m != cfg_mtime or needs_grant():
             cfg_mtime = m
             cfg = lc.load_config()
+            if thermal.active and lc.thermal_mode(cfg) != "target":
+                thermal.restore()
+            sync_thermald(cfg)
             grant()
 
 

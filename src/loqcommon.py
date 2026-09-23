@@ -206,13 +206,33 @@ def thermal_settings(cfg, source):
     return d
 
 
+THERMAL_MODES = [("dtt", "Lenovo DTT"), ("target", "Target temperature"), ("off", "Off")]
+
+
+def thermal_mode(cfg):
+    m = (cfg.get("thermal") or {}).get("mode", "dtt")
+    return m if m in dict(THERMAL_MODES) else "dtt"
+
+
+def skin_sensors():
+    out = []
+    for z in sorted(glob.glob("/sys/class/thermal/thermal_zone*"), key=lambda p: int(p.rsplit("zone", 1)[1])):
+        t = read(os.path.join(z, "type"), "")
+        if t.startswith("SEN"):
+            v = read_int(os.path.join(z, "temp"))
+            if v is not None:
+                out.append((t, v / 1000))
+    return out
+
+
 def power_source():
     return "battery" if ac_online() is False else "ac"
 
 
 def default_config():
     return {
-        "thermal": {"ac": {"enabled": False, "target": 82, "min_watts": 20},
+        "thermal": {"mode": "dtt",
+                    "ac": {"enabled": False, "target": 82, "min_watts": 20},
                     "battery": {"enabled": False, "target": 75, "min_watts": 12}},
         "restore_profile": False,
         "profile": None,

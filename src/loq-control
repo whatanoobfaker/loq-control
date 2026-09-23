@@ -490,12 +490,12 @@ class PowerPage:
         tg.setVerticalSpacing(10)
         head = QVBoxLayout()
         head.setSpacing(0)
-        ht = QLabel("Hold the CPU at a target temperature")
+        ht = QLabel("Automatic thermal control")
         ht.setObjectName("rowTitle")
-        hd = QLabel("Adjusts the CPU power limit every second, like Intel DTT on Windows. A cooler chip leaks less, "
-                    "so it keeps higher clocks per watt instead of hitting 97 °C and throttling hard. Works in every mode. "
-                    "Plugged in and on battery have separate settings; the limit never exceeds what the firmware allows "
-                    "for the current power source.")
+        hd = QLabel("Lenovo DTT runs Intel's thermald on the DTT tables in your BIOS, the same rules Windows uses: "
+                    "per-mode power ranges and throttling driven by the CPU and five skin sensors. Target temperature "
+                    "is LOQ Control's own loop that holds the CPU at a chosen temperature, with separate plugged-in and "
+                    "battery settings below. Only one runs at a time.")
         hd.setObjectName("hint")
         hd.setWordWrap(True)
         head.addWidget(ht)
@@ -503,7 +503,8 @@ class PowerPage:
         tg.addLayout(head, 0, 0, 1, 3)
         self.th_switch = Switch()
         tg.addWidget(self.th_switch, 0, 3, Qt.AlignRight | Qt.AlignTop)
-        tg.addWidget(QLabel("Target temperature"), 1, 0)
+        self.th_lab1 = QLabel("Target temperature")
+        tg.addWidget(self.th_lab1, 3, 0)
         self.th_target = QSlider(Qt.Horizontal)
         self.th_target.setRange(65, 95)
         self.th_target_sp = QSpinBox()
@@ -511,9 +512,10 @@ class PowerPage:
         self.th_target_sp.setSuffix(" °C")
         self.th_target.valueChanged.connect(self.th_target_sp.setValue)
         self.th_target_sp.valueChanged.connect(self.th_target.setValue)
-        tg.addWidget(self.th_target, 1, 1)
-        tg.addWidget(self.th_target_sp, 1, 2)
-        tg.addWidget(QLabel("Never below"), 2, 0)
+        tg.addWidget(self.th_target, 3, 1)
+        tg.addWidget(self.th_target_sp, 3, 2)
+        self.th_lab2 = QLabel("Never below")
+        tg.addWidget(self.th_lab2, 4, 0)
         self.th_min = QSlider(Qt.Horizontal)
         self.th_min.setRange(10, 45)
         self.th_min_sp = QSpinBox()
@@ -521,16 +523,21 @@ class PowerPage:
         self.th_min_sp.setSuffix(" W")
         self.th_min.valueChanged.connect(self.th_min_sp.setValue)
         self.th_min_sp.valueChanged.connect(self.th_min.setValue)
-        tg.addWidget(self.th_min, 2, 1)
-        tg.addWidget(self.th_min_sp, 2, 2)
+        tg.addWidget(self.th_min, 4, 1)
+        tg.addWidget(self.th_min_sp, 4, 2)
         self.th_state = QLabel()
         self.th_state.setObjectName("hint")
-        tg.addWidget(self.th_state, 3, 0, 1, 4)
+        tg.addWidget(self.th_state, 5, 0, 1, 4)
         tg.setColumnStretch(1, 1)
+        self.th_mode = Segmented()
+        self.th_mode.set_items(lc.THERMAL_MODES)
+        self.th_mode.clicked.connect(self.set_thermal_mode)
+        tg.addWidget(self.th_mode, 1, 0, 1, 4)
+        self.th_mode.select(lc.thermal_mode(self.win.cfg))
         self.th_source = Segmented()
         self.th_source.set_items([("ac", "Plugged in"), ("battery", "On battery")])
         self.th_source.clicked.connect(self.load_thermal)
-        tg.addWidget(self.th_source, 4, 0, 1, 4)
+        tg.addWidget(self.th_source, 2, 0, 1, 4)
         self.th_src = lc.power_source()
         self.th_source.select(self.th_src)
         self.load_thermal(self.th_src)
@@ -610,8 +617,13 @@ class PowerPage:
         for w in (self.th_switch, self.th_target_sp, self.th_min_sp, self.th_target, self.th_min):
             w.blockSignals(False)
 
+    def set_thermal_mode(self, mode):
+        self.win.cfg.setdefault("thermal", {})["mode"] = mode
+        self.save_thermal()
+
     def save_thermal(self, *_):
         th = {k: lc.thermal_settings(self.win.cfg, k) for k in ("ac", "battery")}
+        th["mode"] = lc.thermal_mode(self.win.cfg)
         th[self.th_src] = {"enabled": self.th_switch.isChecked(), "target": self.th_target_sp.value(),
                            "min_watts": self.th_min_sp.value()}
         self.win.cfg["thermal"] = th
@@ -665,7 +677,20 @@ class PowerPage:
         st = lc.load_json(lc.THERMAL_STATUS, {})
         now = lc.power_source()
         names = {"ac": "plugged in", "battery": "on battery"}
-        if st.get("active") and st.get("pl1") is not None:
+        mode = lc.thermal_mode(self.win.cfg)
+        for w in (self.th_switch, self.th_target, self.th_target_sp, self.th_min, self.th_min_sp,
+                  self.th_lab1, self.th_lab2, self.th_source):
+            w.setVisible(mode == "target")
+        pl = lc.rapl_limits("/sys/class/powercap/intel-rapl-mmio:0")
+        lim = "PL1 %.0f W · PL2 %.0f W" % (pl[0] / 1e6, pl[1] / 1e6) if pl[0] and pl[1] else ""
+        skins = "  ".join("%s %.0f°" % (n, t) for n, t in lc.skin_sensors())
+        if mode == "dtt":
+            running = subprocess.run(["systemctl", "is-active", "--quiet", "thermald.service"]).returncode == 0
+            self.th_state.setText("Lenovo DTT via thermald: %s · %s\nSkin sensors: %s" % (
+                "running, following the BIOS tables for this mode" if running else "not running", lim, skins))
+        elif mode == "off":
+            self.th_state.setText("Off: the firmware alone decides (up to 95 W in Balanced). %s" % lim)
+        elif st.get("active") and st.get("pl1") is not None:
             self.th_state.setText("Now %s · active: CPU power limit %.0f W of the firmware's %.0f W · CPU %.0f °C" % (
                 names[now], st["pl1"], st.get("ceiling") or 0, st.get("temp") or 0))
         elif lc.thermal_settings(self.win.cfg, now)["enabled"]:

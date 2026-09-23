@@ -9,6 +9,9 @@ Fan curve, power limit and device control for the **Lenovo LOQ 15IRX9** (BIOS `N
   curve on every mode change; `loqd` puts yours back.
 - **Device**: battery conservation, rapid charge, Fn lock, Windows key, touchpad, display overdrive, G-Sync,
   camera, keyboard backlight and lighting.
+- **Automatic thermal control**: Lenovo DTT through Intel's `thermald --adaptive`, which runs the DTT tables in the
+  BIOS (per-mode power ranges, skin-sensor throttling) like Windows does, or LOQ Control's own target-temperature
+  loop on the RAPL limits.
 - **Tray icon** with live CPU temperature, quick mode switching and a maximum-fans toggle.
 
 ## Components
@@ -26,7 +29,7 @@ Power modes and limits go through the kernel's `lenovo-wmi-gamezone` / `lenovo-w
 
 ## Install
 
-Requires `dkms`, kernel headers, `python-pyside6`, and membership in the `wheel` group.
+Requires `dkms`, kernel headers, `python-pyside6`, `thermald` (for Lenovo DTT), and membership in the `wheel` group.
 
 ```sh
 ./install.sh
