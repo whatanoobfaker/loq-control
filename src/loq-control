@@ -625,8 +625,12 @@ class PowerPage:
     def load(self):
         saved = self.win.cfg.get("limits", {})
         for name, (sp, _info) in self.rows.items():
-            cur = lc.limit_info(name)
-            sp.setValue(saved.get(name, cur["value"] if cur else 0))
+            cur = lc.limit_info(name) or {}
+            v = saved.get(name)
+            for cand in (v, cur.get("value"), cur.get("default"), cur.get("min"), sp.minimum()):
+                if cand is not None:
+                    sp.setValue(int(cand))
+                    break
 
     def defaults(self):
         for name, (sp, info) in self.rows.items():
@@ -668,9 +672,10 @@ class PowerPage:
             self.th_state.setText("Now %s · starting…" % names[now])
         else:
             self.th_state.setText("Now %s · off for this power source: the firmware alone decides." % names[now])
-        self.note.setText("Active now." if custom else
-                          "Not active: the firmware only accepts these in Custom mode. "
-                          "Applying will offer to switch.")
+        warn = ("Warning: on the LOQ 15IRX9 (BIOS NECN), Custom mode is reported to make the embedded controller "
+                "assert BD PROCHOT under load and drop the CPU to 400 MHz. Prefer the smart thermal control above.")
+        self.note.setText(("Active now. " if custom else
+                           "Not active: the firmware only accepts these in Custom mode. ") + warn)
 
 
 class FanPage:
