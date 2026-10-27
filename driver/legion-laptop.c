@@ -103,6 +103,11 @@ MODULE_PARM_DESC(
 //Size of fancurve stored in embedded controller
 #define MAXFANCURVESIZE 10
 
+// Highest fan speed accepted in a fan curve. The LOQ 15IRX9 firmware itself
+// programs 5800 RPM in its Extreme and Custom curves; the old 4500 limit
+// left Balanced and Performance short of what the fans are built for.
+#define MAX_FAN_RPM 5800
+
 #define LEGION_DRVR_SHORTNAME "legion"
 #define LEGION_HWMON_NAME LEGION_DRVR_SHORTNAME "_hwmon"
 
@@ -2134,7 +2139,7 @@ static bool fancurve_is_valid_max_temp(int max_temp)
 
 static bool fancurve_set_rpm1(struct fancurve *fancurve, int point_id, int rpm)
 {
-	bool valid = point_id == 0 ? rpm == 0 : (rpm >= 0 && rpm <= 4500);
+	bool valid = point_id == 0 ? rpm == 0 : (rpm >= 0 && rpm <= MAX_FAN_RPM);
 
 	if (valid)
 		fancurve->points[point_id].rpm1_raw = rpm / 100;
@@ -2143,7 +2148,7 @@ static bool fancurve_set_rpm1(struct fancurve *fancurve, int point_id, int rpm)
 
 static bool fancurve_set_rpm2(struct fancurve *fancurve, int point_id, int rpm)
 {
-	bool valid = point_id == 0 ? rpm == 0 : (rpm >= 0 && rpm <= 4500);
+	bool valid = point_id == 0 ? rpm == 0 : (rpm >= 0 && rpm <= MAX_FAN_RPM);
 
 	if (valid)
 		fancurve->points[point_id].rpm2_raw = rpm / 100;
@@ -4607,7 +4612,7 @@ static ssize_t fancurve_store(struct device *dev,
 			goto out;
 		}
 		p += consumed;
-		if (cpu > 127 || gpu > 127 || rpm1 > 4500 || rpm2 > 4500 ||
+		if (cpu > 127 || gpu > 127 || rpm1 > MAX_FAN_RPM || rpm2 > MAX_FAN_RPM ||
 		    (i == 0 && (rpm1 || rpm2)) || cpu < prev_cpu ||
 		    max(rpm1, rpm2) < prev_rpm) {
 			err = -EINVAL;

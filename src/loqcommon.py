@@ -1,3 +1,4 @@
+import fcntl
 import glob
 import json
 import os
@@ -13,8 +14,10 @@ STATE_DIR = "/var/lib/loq-control"
 CONFIG = os.path.join(STATE_DIR, "config.json")
 FIRMWARE_CURVES = os.path.join(STATE_DIR, "firmware-curves.json")
 RUN_DIR = "/run/loq-control"
+GUEST_CPL_FILE = "/dev/shm/loq-npcf-cpl"
+GUEST_MODE_FILE = "/dev/shm/loq-npcf-mode"
 GROUP = "wheel"
-MAX_RPM = 4500
+MAX_RPM = 5800  # the firmware's own Extreme/Custom curves run the fans this fast
 CURVE_POINTS = 10
 
 PROFILE_LABELS = {
@@ -26,17 +29,12 @@ PROFILE_LABELS = {
     "custom": "Custom",
 }
 
-LIMIT_ATTRS = [
-    ("cpu_temp", "CPU temperature target", "°C"),
-    ("ppt_pl1_spl", "CPU sustained power (PL1)", "W"),
-    ("ppt_pl2_sppt", "CPU burst power (PL2)", "W"),
-    ("ppt_pl1_tau", "CPU burst duration", "s"),
-    ("ppt_cpu_cl", "CPU power when GPU is loaded", "W"),
-    ("gpu_temp", "GPU temperature limit", "°C"),
-    ("gpu_nv_ctgp", "GPU configurable TGP", "W"),
-    ("gpu_nv_ppab", "GPU Dynamic Boost", "W"),
-    ("gpu_nv_ac_offset", "GPU total power offset", "W"),
-]
+# Auto mode moves between these two firmware modes, the way Lenovo Vantage's
+# Auto mode does: Balanced keeps the fans capped and quiet, Extreme lets the
+# EC run them to full speed and raises the limits.
+AUTO_LOW = "balanced"
+AUTO_HIGH = "max-power"
+
 
 TOGGLES = [
     ("conservation_mode", IDEAPAD, "Battery conservation", "Stop charging at about 80% to extend battery life", "battery"),
@@ -146,22 +144,6 @@ def validate_curve(points):
     return None
 
 
-def limit_info(name):
-    d = os.path.join(FWA, name)
-    if not os.path.isdir(d):
-        return None
-    return {
-        "value": read_int(os.path.join(d, "current_value")),
-        "min": read_int(os.path.join(d, "min_value")),
-        "max": read_int(os.path.join(d, "max_value")),
-        "default": read_int(os.path.join(d, "default_value")),
-        "step": read_int(os.path.join(d, "scalar_increment"), 1) or 1,
-        "desc": read(os.path.join(d, "display_name"), name),
-    }
-
-
-def set_limit(name, value):
-    write(os.path.join(FWA, name, "current_value"), int(value))
 
 
 def toggle_path(name):
@@ -192,26 +174,47 @@ def rapl_limits(domain):
     return pl1, pl2
 
 
+# CPU PL1 ceiling in W requested by a VM's NVIDIA Dynamic Boost, or None.
+# loqd keeps it current; every PL1 write goes through set_rapl and respects it.
+guest_pl1_cap = None
+
+
 def set_rapl(domain, pl1_uw, pl2_uw):
+    if guest_pl1_cap is not None:
+        pl1_uw = min(pl1_uw, guest_pl1_cap * 1e6)
     write(os.path.join(domain, "constraint_0_power_limit_uw"), int(pl1_uw))
     write(os.path.join(domain, "constraint_1_power_limit_uw"), int(pl2_uw))
+    return int(pl1_uw), int(pl2_uw)
 
 
-def thermal_settings(cfg, source):
-    t = cfg.get("thermal") or {}
-    if "enabled" in t:
-        t = {"ac": dict(t), "battery": dict(t)}
-    d = default_config()["thermal"][source]
-    d.update(t.get(source) or {})
-    return d
+def guest_cpu_limit(path=GUEST_CPL_FILE):
+    """CPU PL1 in W that a VM's NVIDIA Dynamic Boost asked for, or None.
 
+    On bare metal the NVIDIA driver lowers the CPU's PL1 through NPCF
+    function 9 when it wants the shared power and cooling budget for the GPU.
+    With the GPU passed through, the guest's NPCF forwards that request to
+    QEMU's isa-batmon, which writes it here as a u32 LE in mW and holds a
+    shared flock on the file while the VM runs. A file nobody holds is stale.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return None
+        except BlockingIOError:
+            pass
+        data = os.pread(fd, 4, 0)
+    finally:
+        os.close(fd)
+    if len(data) != 4:
+        return None
+    mw = int.from_bytes(data, "little")
+    return mw / 1000 if mw else None
 
-THERMAL_MODES = [("dtt", "Lenovo DTT"), ("target", "Target temperature"), ("off", "Off")]
-
-
-def thermal_mode(cfg):
-    m = (cfg.get("thermal") or {}).get("mode", "dtt")
-    return m if m in dict(THERMAL_MODES) else "dtt"
 
 
 def skin_sensors():
@@ -231,13 +234,8 @@ def power_source():
 
 def default_config():
     return {
-        "thermal": {"mode": "dtt",
-                    "ac": {"enabled": False, "target": 82, "min_watts": 20},
-                    "battery": {"enabled": False, "target": 75, "min_watts": 12}},
-        "restore_profile": False,
-        "profile": None,
+        "auto": True,
         "curves": {},
-        "limits": {},
         "toggles": {},
         "leds": {},
     }

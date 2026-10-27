@@ -2,18 +2,21 @@
 
 Fan curve, power limit and device control for the **Lenovo LOQ 15IRX9** (BIOS `NECN`) on Linux, in one app.
 
-- **Dashboard**: CPU/GPU temperature, fan speeds, CPU package power and limits, clocks, battery, live charts.
-- **Power**: firmware power modes (Quiet, Balanced, Performance, Extreme, Custom) and Custom-mode limits:
-  CPU temperature target, PL1/PL2, burst duration, cross-load limit, GPU cTGP / Dynamic Boost / temperature limit.
-- **Fans**: per-mode fan curve editor (drag the points or edit the table) with presets. The firmware resets the
-  curve on every mode change; `loqd` puts yours back.
+- **Auto mode** (default), like Lenovo Vantage's: stays in Balanced, where the EC keeps the fans quiet and capped
+  at about 4000 RPM, moves to Extreme when the CPU or GPU stays hot (fans up to 5800 RPM, higher limits), and
+  drops back once things cool down. Picking a mode by hand, in the app or with Fn+Q, turns Auto off.
+- **Overview**: power mode, CPU/GPU temperature, fan speed, CPU power, live charts.
+- **Fans**: per-mode fan curve editor (drag the points) with presets. The firmware resets the curve on every mode
+  change; `loqd` puts yours back.
 - **Device**: battery conservation, rapid charge, Fn lock, Windows key, touchpad, display overdrive, G-Sync,
   camera, keyboard backlight and lighting.
-- **Automatic thermal control**: Lenovo DTT, a port of the adaptive engine of Intel's thermald built into `loqd`.
-  It parses the DTT data vault (GDDV) in the BIOS, matches its conditions (power mode, AC/battery, lid, sensor
-  temperatures) to a target, and applies that target's PL1 range, PL2 and skin-sensor passive trips through RAPL,
-  like DTT on Windows. LOQ Control's own target-temperature loop is the alternative.
-- **Tray icon** with live CPU temperature, quick mode switching and a maximum-fans toggle.
+- **Lenovo DTT**, always on: a port of the adaptive engine of Intel's thermald built into `loqd`. It parses the
+  DTT data vault (GDDV) in the BIOS, matches its conditions (power mode, AC/battery, lid, sensor temperatures) to
+  a target, and applies that target's PL1 range, PL2 and skin-sensor passive trips through RAPL, like DTT on
+  Windows.
+- **VM Dynamic Boost**: with the GPU passed through to a VM, the guest NVIDIA driver's CPU power requests
+  (NPCF function 9) reach `loqd` through `/dev/shm/loq-npcf-cpl` and are applied as PL1, as on bare metal.
+- **Tray icon** with live CPU temperature and quick mode switching.
 
 ## Components
 
